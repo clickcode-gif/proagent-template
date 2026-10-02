@@ -9,49 +9,66 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMe
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langchain_google_vertexai import ChatVertexAI
-from google.cloud import bigquery
 from langgraph_checkpoint_firestore import FirestoreSaver
+from langchain_mcp_adapters.client import MultiServerMCPClient
+import google.auth.transport.requests
+import google.oauth2.id_token
 
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", os.getenv("PROJECT_ID", "default-project"))
 LOCATION = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")
 CHECKPOINTS_COLLECTION = os.getenv("CHECKPOINTS_COLLECTION", "agent_checkpoints")
+# mcp-tools-service'in Cloud Run URL'i (sondaki / olmadan). Boş bırakılırsa
+# arac cagrisi acik bir hata doner.
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "").rstrip("/")
 
-bq_client = bigquery.Client(project=PROJECT_ID)
 
-# 1. Gercek Arac Tanimi (BigQuery Canli Telemetri Sorgusu)
+def _fetch_mcp_id_token() -> str:
+    """mcp-tools-service'e kimlik dogrulamali cagri yapmak icin, agent-service'in
+    kendi Cloud Run calisma zamani servis hesabi uzerinden bir ID token alir
+    (gcloud auth print-identity-token --impersonate-service-account ile ayni
+    mekanizmanin Python karsiligi; metadata server uzerinden calisir)."""
+    auth_request = google.auth.transport.requests.Request()
+    return google.oauth2.id_token.fetch_id_token(auth_request, MCP_SERVER_URL)
+
+
+# 1. Gercek Arac Tanimi (MCP protokolu uzerinden BigQuery Canli Telemetri Sorgusu)
+#
+# Bu arac artik BigQuery'yi dogrudan sorgulamiyor: istegi, ayri bir Cloud Run
+# servisi olarak calisan mcp-tools-service'e (bkz. mcp-tools-service/mcp_server.py)
+# standart MCP (Model Context Protocol) uzerinden iletiyor. Her cagrida taze bir
+# kimlik token'i alinir (token'lar ~1 saatte suresi doldugundan statik olarak
+# saklanmaz), yeni bir MCP oturumu acilir ve sonuc LangGraph'in bekledigi duz
+# metin formatina cevrilir. Fonksiyonun adi ve donus formati oncekiyle ayni
+# kaldigi icin graf'in geri kalani (route_after_tools dahil) degismeden calisir.
 @tool
 async def query_live_well_pressure(well_id: str) -> str:
-    """BigQuery uzerindeki canli kuyu basinc telemetrisini sorgular."""
-    query = """
-        SELECT well_id, pressure_psi, temperature_c, timestamp
-        FROM `{project}.telemetry_data.well_metrics`
-        WHERE well_id = @well_id
-        ORDER BY timestamp DESC
-        LIMIT 1
-    """.format(project=PROJECT_ID)
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("well_id", "STRING", well_id)
-        ]
-    )
+    """MCP sunucusu uzerinden canli kuyu basinc telemetrisini sorgular."""
+    if not MCP_SERVER_URL:
+        return "Hata: MCP_SERVER_URL ortam degiskeni ayarlanmamis."
 
-    # Asenkron yurutme (BigQuery client'i senkron oldugu icin executor'a devrediyoruz)
-    loop = asyncio.get_event_loop()
-    query_job = await loop.run_in_executor(
-        None, lambda: bq_client.query(query, job_config=job_config).result()
-    )
+    try:
+        loop = asyncio.get_event_loop()
+        token = await loop.run_in_executor(None, _fetch_mcp_id_token)
 
-    rows = list(query_job)
-    if not rows:
-        return f"Kuyu kaydi bulunamadi: {well_id}"
+        connection = {
+            "telemetry": {
+                "transport": "streamable_http",
+                "url": f"{MCP_SERVER_URL}/mcp",
+                "headers": {"Authorization": f"Bearer {token}"},
+            }
+        }
+        client = MultiServerMCPClient(connection)
+        async with client.session("telemetry") as session:
+            result = await session.call_tool("query_live_well_pressure", {"well_id": well_id})
 
-    row = rows[0]
-    psi = row["pressure_psi"]
-    status = "KRITIK SAPMA" if psi > 4000 else "NORMAL"
-    return (
-        f"[BigQuery Canli Telemetri] Kuyu: {row['well_id']} | "
-        f"Basinc: {psi} PSI | Sicaklik: {row['temperature_c']}C | Durum: {status}"
-    )
+        text_parts = [block.text for block in result.content if hasattr(block, "text")]
+        text = "\n".join(text_parts) if text_parts else str(result.content)
+
+        if result.isError:
+            return f"MCP arac hatasi: {text}"
+        return text
+    except Exception as e:
+        return f"MCP baglanti hatasi: {e}"
 
 # Arac listesi
 tools = [query_live_well_pressure]
